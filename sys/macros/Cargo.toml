@@ -1,0 +1,15 @@
+[package]
+name = "boltk-macros"
+version = "0.1.0"
+edition = "2021"
+authors = ["xvanc <xvancm@gmail.com>"]
+license = "BSD-3-Clause"
+
+[lib]
+proc-macro = true
+doc = false
+
+[dependencies]
+syn = { version = "1.0", features = ["full", "printing", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"

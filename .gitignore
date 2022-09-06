@@ -1,0 +1,7 @@
+.DS_Store
+_/
+target/
+qemu-log.txt
+qemu-monitor.sock
+local.mk
+**/.vscode/settings.json

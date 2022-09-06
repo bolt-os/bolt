@@ -1,0 +1,8 @@
+[build]
+rustflags = [
+    "-Cforce-unwind-tables", "-Cforce-frame-pointers",
+    "-Csymbol-mangling-version=v0", "-Zrandomize-layout"
+]
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

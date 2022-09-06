@@ -1,0 +1,34 @@
+[package]
+name    = "boltk"
+version = "0.1.0"
+edition = "2021"
+authors = ["xvanc <xvancm@gmail.com>"]
+publish = false
+
+[[bin]]
+name = "boltk"
+path = "kern/main.rs"
+
+[features]
+default = []
+
+[build-dependencies]
+xcomp = { path = "../../lib/xcomp" }
+
+[dependencies]
+boltk-macros = { path = "../macros" }
+bolt-libelf = { git = "https://github.com/bolt-os/libelf.git" }
+libsa = { git = "https://github.com/bolt-os/libsa.git" }
+# limine = { git = "https://github.com/bolt-os/limine-rs.git" }
+limine = { path = "../../../limine" }
+bitflags = "1.3"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+log = "0.4"
+memoffset = { version = "0.6", features = ["unstable_const"] }
+rustc-demangle = "0.1"
+spin = "0.9"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid = "10.3"
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+spark = { path = "../../../spark/libspark" }
