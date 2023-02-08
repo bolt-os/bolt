@@ -1,0 +1,10 @@
+[package]
+name = "bolt-xtask"
+version = "0.1.0"
+edition = "2021"
+authors = ["xvanc <xvancm@gmail.com>"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.1", features = ["derive"] }
+clap_mangen = "0.2"
