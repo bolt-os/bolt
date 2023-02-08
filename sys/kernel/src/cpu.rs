@@ -28,49 +28,30 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#![no_std]
-#![no_main]
-// Unstable Features
-#![feature(
-    prelude_import,
-    asm_const,                              // https://github.com/rust-lang/rust/issues/93332
-    custom_test_frameworks,                 // https://github.com/rust-lang/rust/issues/50297
-)]
-// Custom Test Framework
-#![reexport_test_harness_main = "test_main"]
-#![test_runner(test::run)]
+use crate::arch;
 
-#[cfg(notyet)]
-extern crate alloc;
+pub trait ArchCpu {
+    type Data;
 
-#[prelude_import]
-#[allow(unused_imports)]
-use self::prelude::*;
-mod prelude {
-    // Bring back core's prelude.
-    pub use core::{
-        // Bring back `asm!`. (i'm still bitter)
-        arch::{asm, global_asm},
-        // prelude::*,
-        prelude::rust_2021::*,
-    };
-
-    // Items from `alloc` usually included by `std`'s prelude.
-    #[cfg(notyet)]
-    pub use alloc::{
-        borrow::ToOwned,
-        boxed::Box,
-        format,
-        string::{String, ToString},
-        vec,
-        vec::Vec,
-    };
+    fn get_current_cpu() -> *mut Cpu;
 }
 
-mod arch;
-mod cpu;
-mod panic;
-mod test;
+pub type MdCpu = <arch::ThisArch as ArchCpu>::Data;
 
-/// Main machine-independent kernel entry point
-pub fn main() {}
+/// Per-CPU Structure
+///
+/// The `Cpu` struct for the current CPU can be retrieved with [`this_cpu()`].
+pub struct Cpu {
+    pub md_data: MdCpu,
+}
+
+/// Returns a pointer to the [`Cpu`] structure for the current CPU.
+///
+/// # Safety
+///
+/// The returned pointer is immediately considered stale. It is the responsiblity of
+/// the caller to ensure that the thread is not migrated to another CPU while accessing
+/// the structure. 
+pub fn this_cpu() -> *mut Cpu {
+    <arch::ThisArch as ArchCpu>::get_current_cpu()
+}

@@ -28,49 +28,32 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#![no_std]
-#![no_main]
-// Unstable Features
-#![feature(
-    prelude_import,
-    asm_const,                              // https://github.com/rust-lang/rust/issues/93332
-    custom_test_frameworks,                 // https://github.com/rust-lang/rust/issues/50297
-)]
-// Custom Test Framework
-#![reexport_test_harness_main = "test_main"]
-#![test_runner(test::run)]
+use crate::{
+    arch::ThisArch,
+    cpu::{self, Cpu},
+};
+use memoffset::offset_of;
 
-#[cfg(notyet)]
-extern crate alloc;
+impl cpu::ArchCpu for ThisArch {
+    type Data = CpuData;
 
-#[prelude_import]
-#[allow(unused_imports)]
-use self::prelude::*;
-mod prelude {
-    // Bring back core's prelude.
-    pub use core::{
-        // Bring back `asm!`. (i'm still bitter)
-        arch::{asm, global_asm},
-        // prelude::*,
-        prelude::rust_2021::*,
-    };
+    #[inline(always)]
+    fn get_current_cpu() -> *mut Cpu {
+        let this_cpu;
 
-    // Items from `alloc` usually included by `std`'s prelude.
-    #[cfg(notyet)]
-    pub use alloc::{
-        borrow::ToOwned,
-        boxed::Box,
-        format,
-        string::{String, ToString},
-        vec,
-        vec::Vec,
-    };
+        unsafe {
+            asm!(
+                "mov {:r}, gs:[{}]",
+                out(reg) this_cpu,
+                const offset_of!(Cpu, md_data) + offset_of!(CpuData, this_cpu),
+                options(nostack, preserves_flags),
+            );
+        }
+
+        this_cpu
+    }
 }
 
-mod arch;
-mod cpu;
-mod panic;
-mod test;
-
-/// Main machine-independent kernel entry point
-pub fn main() {}
+pub struct CpuData {
+    this_cpu: *mut Cpu,
+}
