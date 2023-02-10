@@ -71,6 +71,7 @@ mod arch;
 mod cpu;
 mod panic;
 mod test;
+mod trap;
 
 /// Main machine-independent kernel entry point
 pub fn main() {}

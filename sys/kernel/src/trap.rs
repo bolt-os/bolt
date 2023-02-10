@@ -28,27 +28,21 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-mod cpu;
-mod trap;
+use crate::arch;
 
-pub fn hcf() -> ! {
-    loop {
-        unsafe { asm!("cli; hlt") };
-    }
+pub trait ArchTrap {
+    type DisableToken: Copy;
+
+    fn disable() -> Self::DisableToken;
+    fn enable(token: Self::DisableToken);
 }
 
-unsafe fn port3f8_write(s: &str) {
-    asm!(
-        "rep outsb",
-        in("rsi") s.as_ptr(),
-        in("ecx") s.len(),
-        in("edx") 0x3f8,
-        options(nostack, preserves_flags),
-    );
+pub type DisableToken = <arch::ThisArch as ArchTrap>::DisableToken;
+
+pub fn disable() -> DisableToken {
+    <arch::ThisArch as ArchTrap>::disable()
 }
 
-#[no_mangle]
-unsafe extern "C" fn _start() -> ! {
-    port3f8_write("hello, world!\r\n");
-    hcf();
+pub fn enable(token: DisableToken) {
+    <arch::ThisArch as ArchTrap>::enable(token);
 }
