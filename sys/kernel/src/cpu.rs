@@ -49,9 +49,9 @@ pub struct Cpu {
 ///
 /// # Safety
 ///
-/// The returned pointer is immediately considered stale. It is the responsiblity of
+/// The returned pointer is immediately considered stale. It is the responsibility of
 /// the caller to ensure that the thread is not migrated to another CPU while accessing
-/// the structure. 
+/// the structure.
 pub fn this_cpu() -> *mut Cpu {
     <arch::ThisArch as ArchCpu>::get_current_cpu()
 }
