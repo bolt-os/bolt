@@ -28,7 +28,11 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+use core::mem::MaybeUninit;
+use crate::cpu::Cpu;
+
 mod cpu;
+mod msr;
 mod trap;
 
 pub fn hcf() -> ! {
@@ -47,8 +51,16 @@ unsafe fn port3f8_write(s: &str) {
     );
 }
 
+static mut CPU0_STORAGE: MaybeUninit<Cpu> = MaybeUninit::uninit();
+
 #[no_mangle]
 unsafe extern "C" fn _start() -> ! {
     port3f8_write("hello, world!\r\n");
+
+    let this_cpu = CPU0_STORAGE.as_mut_ptr();
+    cpu::early_init(this_cpu);
+
+    port3f8_write("hello, again!\r\n");
+
     hcf();
 }
