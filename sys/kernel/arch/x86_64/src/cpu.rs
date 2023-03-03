@@ -31,8 +31,13 @@
 use crate::{
     arch::{x86_64::msr, ThisArch},
     cpu::{self, Cpu},
+    sync::lazy::Lazy,
 };
-use core::{mem::{size_of, self}, ptr::addr_of_mut};
+use core::{
+    mem::{self, size_of},
+    ptr::addr_of_mut,
+};
+use cpu_features::{CpuFeatures, CpuInfo};
 use memoffset::offset_of;
 
 impl cpu::ArchCpu for ThisArch {
@@ -59,6 +64,7 @@ pub struct CpuData {
     this_cpu: *mut Cpu,
     gdt: Gdt,
     tss: Tss,
+    cpu_info: CpuInfo,
 }
 
 #[repr(C)]
@@ -82,6 +88,8 @@ struct Tss {
     reserved1: [u16; 5],
     io_map_base: u16,
 }
+
+pub static CPU_FEATURES: Lazy<CpuFeatures> = Lazy::new(|| unimplemented!());
 
 pub unsafe fn early_init(cpu: *mut Cpu) {
     let mdcpu = addr_of_mut!((*cpu).md_data);
@@ -111,7 +119,7 @@ pub unsafe fn early_init(cpu: *mut Cpu) {
     let gdt = addr_of_mut!((*mdcpu).gdt);
     gdt.write(Gdt {
         null: 0x0000000000000000,
-        kernel_code: 0x00609a0000000000,
+        kernel_code: 0x00209a0000000000,
         kernel_data: 0x0000920000000000,
         user_code_32: 0x00cffa000000ffff,
         user_data_32: 0x00cff2000000ffff,
@@ -120,6 +128,10 @@ pub unsafe fn early_init(cpu: *mut Cpu) {
         tss: tss_desc_lo,
         tss_hi: tss_desc_hi,
     });
+
+    let cpu_info = cpu_features::init();
+    Lazy::initialize_with(&CPU_FEATURES, cpu_info.features.clone());
+    addr_of_mut!((*mdcpu).cpu_info).write(cpu_info);
 
     asm!(
         // Load the Global Descriptor Table Register.
@@ -139,7 +151,7 @@ pub unsafe fn early_init(cpu: *mut Cpu) {
             add     rsp, 16
         ",
 
-        // Load the segment registers.
+        // Load the code segment register.
         //
         // We cannot use a simple far jump to set CS in Long Mode.
         // Instead, we create a far call frame on the stack and execute a far return
