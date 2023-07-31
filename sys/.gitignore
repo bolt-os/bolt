@@ -1,4 +1,4 @@
 /_
 /.cargo
 /.vscode
-/target
+target/
