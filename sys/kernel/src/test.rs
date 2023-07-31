@@ -28,4 +28,25 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-pub fn run(_tests: &[&dyn Fn()]) {}
+pub struct Case {
+    pub name: &'static str,
+    pub func: fn(),
+    pub quiet: bool,
+}
+
+pub fn run(tests: &[&Case]) {
+    log::info!("running {} tests", tests.len());
+
+    let mut suppressed = 0;
+    for test in tests {
+        if test.quiet {
+            suppressed += 1;
+        } else {
+            log::info!("running test: `{}`", test.name);
+        }
+        (test.func)();
+    }
+
+    log::info!("tests completed successfully");
+    log::info!("suppressed output {suppressed} test cases");
+}
