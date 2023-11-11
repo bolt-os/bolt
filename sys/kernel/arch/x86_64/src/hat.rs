@@ -36,14 +36,13 @@ use core::{
 };
 
 use cpu_features::CpuFeat;
+use x86_64::{control::Cr4, msr::Efer};
 
 use super::cpu::{self, CPU_FEATURES};
 use crate::{
-    alloc::sync::Arc,
     arch::ThisArch,
-    spl::Ipl,
     sync::{lazy::Lazy, mutex::MutexKind, Mutex},
-    util::size_of,
+    util::{bootstrap_cell::BootstrapCell, pow2, size_of},
     vm::{self, page::PMAP_QUEUE, PhysAddr, Prot, VirtAddr, PAGE_SIZE},
 };
 
@@ -52,19 +51,24 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     AlreadyMapped(PhysAddr),
+    HugePage(PageSize, PhysAddr),
 }
 
 impl VirtAddr {
     const fn index_for(self, level: u32) -> usize {
         self.0 >> (12 + 9 * level) & 0x1ff
     }
+
+    fn is_canonical(self) -> bool {
+        !MMU_INFO.noncanonical_hole.contains(&self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageSize {
-    Normal = 0,
-    Mega   = 1,
-    Giga   = 2,
+    Size4KiB = 0,
+    Size2MiB = 1,
+    Size1GiB = 2,
 }
 
 /// Hardware Address Translation Context
@@ -72,28 +76,90 @@ pub enum PageSize {
 /// # Kernel HAT
 pub struct Hat {
     /// Top-level page table
-    top_level:    *mut Pte,
+    top_level:    &'static vm::Page,
     /// Tracks the number of pages of each size mapped into the address space
     mapped_pages: [usize; MAX_PAGE_LEVEL + 1],
+    pcid:         usize,
+    cr3:          usize,
 }
 
 unsafe impl Send for Hat {}
 
-impl Hat {
-    pub fn new(vmspace: Option<&Arc<vm::Vmspace>>) -> Mutex<Hat> {
-        let page = alloc_page_table();
-        Self::with_top_level(page.addr, vmspace)
+impl Drop for Hat {
+    fn drop(&mut self) {
+        log::warn!("TODO: Hat::drop()");
     }
+}
 
-    pub fn with_top_level(top_level: PhysAddr, _vmspace: Option<&Arc<vm::Vmspace>>) -> Mutex<Hat> {
-        Mutex::new(MutexKind::Default, Ipl::VM, Hat {
-            top_level:    top_level.to_virt().as_mut_ptr(),
+impl Hat {
+    pub fn new(asid: usize) -> Mutex<Hat> {
+        // Allocate the top-level table and initialize the global entries.
+        let page = vm::Page::alloc(&mut PMAP_QUEUE.lock()).unwrap();
+        unsafe {
+            page.addr
+                .to_virt()
+                .as_mut_ptr::<Pte>()
+                .copy_from(INITIAL_PTES.as_ptr(), PTES_PER_TABLE);
+        }
+        let pcid = asid & 0xfff;
+        let cr3 = if MMU_INFO.pcide {
+            page.addr.0 | pcid
+        } else {
+            page.addr.0
+        };
+        Mutex::new(MutexKind::Adaptive, Hat {
+            cr3,
+            pcid,
+            top_level: page,
             mapped_pages: [0; MAX_PAGE_LEVEL + 1],
         })
     }
 
-    pub(super) fn cr3(&self) -> usize {
-        unsafe { VirtAddr::new(self.top_level.addr()).to_phys().addr() }
+    pub fn unmap_pages(&mut self, virt: VirtAddr, size: usize, page_size: PageSize) {
+        let map_level = if page_size == PageSize::Size1GiB && !MMU_INFO.gigapages {
+            PageSize::Size2MiB as usize
+        } else {
+            page_size as usize
+        };
+        let page_size = MMU_INFO.page_size[map_level];
+
+        debug_assert!(virt.is_aligned(page_size));
+        debug_assert!(size & (page_size - 1) == 0);
+
+        let mut unmap_virt = virt;
+        let mut num_pages = size / page_size;
+
+        while num_pages > 0 {
+            let mut table = self.top_level.addr.to_virt().as_mut_ptr::<Pte>();
+            let mut level = MMU_INFO.max_level;
+
+            loop {
+                let index = unmap_virt.index_for(level);
+                let entry_ptr = unsafe { table.add(index) };
+                let entry = unsafe { entry_ptr.read_volatile() };
+
+                // Handle parent entries.
+                if level != map_level as u32 {
+                    assert!(entry.present());
+                    assert!(!entry.huge());
+                    table = entry.addr().to_virt().as_mut_ptr();
+                    level -= 1;
+                    continue;
+                }
+
+                let unmap_pages = cmp::min(num_pages, PTES_PER_TABLE - index);
+                for i in 0..unmap_pages {
+                    let entry_ptr = unsafe { entry_ptr.add(i) };
+                    let entry = unsafe { entry_ptr.read_volatile() };
+                    assert!(entry.present());
+                    unsafe { entry_ptr.write_volatile(Pte::NULL) };
+                    unmap_virt += page_size;
+                }
+
+                num_pages -= unmap_pages;
+                break;
+            }
+        }
     }
 
     /// Insert a translation into the address space
@@ -110,26 +176,25 @@ impl Hat {
         page_size: PageSize,
         prot: Prot,
     ) -> Result<()> {
-        let mmu_info = unsafe { &MMU_INFO };
-        let map_level = if page_size == PageSize::Giga && !mmu_info.gigapages {
-            PageSize::Mega as usize
+        let map_level = if page_size == PageSize::Size1GiB && !MMU_INFO.gigapages {
+            PageSize::Size2MiB as usize
         } else {
             page_size as usize
         };
-        let page_size = mmu_info.page_size[map_level];
+        let page_size = MMU_INFO.page_size[map_level];
 
-        debug_assert!(!mmu_info.noncanonical_hole.contains(&virt));
+        debug_assert!(virt.is_canonical());
         debug_assert!(virt.is_aligned(page_size));
         debug_assert!(phys.is_aligned(page_size));
-        debug_assert!(size & (page_size - 1) == 0);
+        debug_assert!(pow2::is_aligned!(size, page_size));
 
         let mut map_virt = virt;
         let mut map_phys = phys;
         let mut num_pages = size / page_size;
 
         while num_pages > 0 {
-            let mut table = self.top_level;
-            let mut level = mmu_info.max_level;
+            let mut table = self.top_level.addr.to_virt().as_mut_ptr::<Pte>();
+            let mut level = MMU_INFO.max_level;
             loop {
                 let table_index = map_virt.index_for(level);
                 let entry_ptr = unsafe { table.add(table_index) };
@@ -157,14 +222,14 @@ impl Hat {
                 }
 
                 // Set up all the entries in this table.
-                let map_pages = cmp::min(num_pages, 512 - table_index);
+                let map_pages = cmp::min(num_pages, PTES_PER_TABLE - table_index);
                 for i in 0..map_pages {
                     let entry_ptr = unsafe { entry_ptr.add(i) };
                     let entry = unsafe { entry_ptr.read_volatile() };
 
                     let new_entry = Pte::new(
                         map_phys,
-                        mmu_info.protmap[prot] | mmu_info.pte_flags[map_level] | PteFlags::PRESENT,
+                        MMU_INFO.protmap[prot] | MMU_INFO.pte_flags[map_level] | PteFlags::PRESENT,
                     );
 
                     // Make sure the entry isn't already present.
@@ -187,14 +252,12 @@ impl Hat {
         Ok(())
     }
 
+    #[inline(always)]
     pub fn switch_to(&self) {
         unsafe {
-            let cr3 = VirtAddr::new(self.top_level.addr()).to_phys().0;
             asm!(
-                "
-                    mov     cr3, {}
-                ",
-                in(reg) cr3,
+                "mov cr3, {}",
+                in(reg) self.cr3,
                 options(nostack, preserves_flags)
             );
         }
@@ -219,6 +282,7 @@ const PARENT_FLAGS: PteFlags = PteFlags::USER.union(PteFlags::WRITE);
 
 struct MmuInfo {
     nx_bit:            PteFlags,
+    global_bit:        PteFlags,
     gigapages:         bool,
     bits:              u32,
     levels:            u32,
@@ -227,71 +291,130 @@ struct MmuInfo {
     noncanonical_hole: Range<VirtAddr>,
     pte_flags:         [PteFlags; MAX_LEVELS],
     page_size:         [usize; MAX_LEVELS],
+    pcide:             bool,
+    max_page_size:     PageSize,
 }
 
-static mut MMU_INFO: MmuInfo = MmuInfo {
-    nx_bit:            PteFlags::empty(),
-    gigapages:         false,
-    protmap:           ProtMap::empty(),
-    bits:              48,
-    levels:            4,
-    max_level:         3,
-    noncanonical_hole: VirtAddr(0x0000800000000000)..VirtAddr(0xffff800000000000),
-    page_size:         [PAGE_SIZE_4K, PAGE_SIZE_2M, PAGE_SIZE_1G, !0, !0],
-    pte_flags:         [
-        PteFlags::empty(),
-        PteFlags::HUGE,
-        PteFlags::HUGE,
-        PteFlags::empty(),
-        PteFlags::empty(),
-    ],
+static MMU_INFO: BootstrapCell<MmuInfo> = unsafe {
+    BootstrapCell::new(MmuInfo {
+        nx_bit:            PteFlags::empty(),
+        gigapages:         false,
+        protmap:           ProtMap::empty(),
+        bits:              48,
+        levels:            4,
+        max_level:         3,
+        noncanonical_hole: VirtAddr(1 << 47)..VirtAddr(!0 << 47),
+        page_size:         [PAGE_SIZE_4K, PAGE_SIZE_2M, PAGE_SIZE_1G, !0, !0],
+        pte_flags:         [
+            PteFlags::empty(),
+            PteFlags::HUGE,
+            PteFlags::HUGE,
+            PteFlags::empty(),
+            PteFlags::empty(),
+        ],
+        pcide:             false,
+        max_page_size:     PageSize::Size2MiB,
+        global_bit:        PteFlags::empty(),
+    })
 };
 
 impl vm::ArchVm for ThisArch {
     type MdPage = ();
-}
 
-#[cfg(feature = "vm_five-level-paging")]
-static FIVE_LEVEL_PAGING_REQUEST: limine::FiveLevelPagingRequest =
-    limine::FiveLevelPagingRequest::new();
-
-pub fn init() {
-    let mut mmu_info = unsafe { &mut MMU_INFO };
-
-    mmu_info
-        .nx_bit
-        .set(PteFlags::NO_EXECUTE, CPU_FEATURES[CpuFeat::EXECUTE_DISABLE]);
-    mmu_info.gigapages = CPU_FEATURES[CpuFeat::EXECUTE_DISABLE];
-    mmu_info.protmap = ProtMap::new(mmu_info.nx_bit);
-
-    #[cfg(feature = "vm_five-level-paging")]
-    if FIVE_LEVEL_PAGING_REQUEST.has_response() {
-        mmu_info.levels = 5;
-        mmu_info.max_level = 4;
-        mmu_info.bits = 57;
-        mmu_info.noncanonical_hole = VirtAddr(0x010000000000000)..VirtAddr(0xff00000000000000);
-
-        log::info!("using 5-level paging");
+    fn min_user_addr() -> VirtAddr {
+        VirtAddr(0x1000)
     }
 
-    let root_table = alloc_page_table();
+    fn max_user_addr() -> VirtAddr {
+        MMU_INFO.noncanonical_hole.end - 1
+    }
+}
 
-    let table = root_table.addr.to_virt().as_mut_ptr::<Pte>();
-    for i in 256..512 {
-        let page = alloc_page_table();
+static PAGING_MODE_REQUEST: limine::PagingModeRequest = limine::PagingModeRequest::new(
+    if cfg!(feature = "vm_five-level-paging") {
+        limine::PagingMode::FiveLevel
+    } else {
+        limine::PagingMode::FourLevel
+    },
+    limine::PagingModeRequestFlags::empty(),
+);
 
-        unsafe {
-            table
-                .add(i)
-                .write_volatile(Pte::new(page.addr, PteFlags::PRESENT));
+static mut INITIAL_PTES: BootstrapCell<[Pte; PTES_PER_TABLE]> =
+    unsafe { BootstrapCell::new([Pte::NULL; PTES_PER_TABLE]) };
+
+pub fn init() {
+    let mmu_info = unsafe { &mut *BootstrapCell::get_mut_ptr(&MMU_INFO) };
+
+    mmu_info.protmap = ProtMap::new(mmu_info.nx_bit);
+
+    let mut cr4 = Cr4::read();
+    let mut efer = Efer::read();
+
+    if CPU_FEATURES[CpuFeat::PAGE_SIZE_1GB] {
+        mmu_info.gigapages = true;
+        mmu_info.max_page_size = PageSize::Size1GiB;
+    }
+    if CPU_FEATURES[CpuFeat::EXECUTE_DISABLE] {
+        mmu_info.nx_bit |= PteFlags::NO_EXECUTE;
+        efer |= Efer::NXE;
+    }
+    if CPU_FEATURES[CpuFeat::PGE] {
+        mmu_info.global_bit = PteFlags::GLOBAL;
+        cr4 |= Cr4::PGE;
+    }
+    if CPU_FEATURES[CpuFeat::PCID] {
+        mmu_info.pcide = true;
+        cr4 |= Cr4::PCIDE;
+    }
+    if CPU_FEATURES[CpuFeat::SMAP] {
+        cr4 |= Cr4::SMAP;
+        log::info!("smap is enabled");
+    }
+    if CPU_FEATURES[CpuFeat::SMEP] {
+        cr4 |= Cr4::SMEP;
+        log::info!("smep is enabled");
+    }
+    if CPU_FEATURES[CpuFeat::UMIP] {
+        cr4 |= Cr4::UMIP;
+        log::info!("smep is enabled");
+    }
+
+    unsafe {
+        cr4.write();
+        efer.write();
+    }
+
+    #[cfg(feature = "vm_five-level-paging")]
+    if let Some(resp) = PAGING_MODE_REQUEST.response() {
+        if resp.mode() == limine::PagingMode::FiveLevel {
+            log::info!("using 5-level paging");
+            assert!(cr4.contains(Cr4::LA57));
+
+            mmu_info.levels = 5;
+            mmu_info.max_level = 4;
+            mmu_info.bits = 57;
+            mmu_info.noncanonical_hole = VirtAddr(1 << 56)..VirtAddr(!0 << 56);
+        } else {
+            assert!(!cr4.contains(Cr4::LA57));
         }
     }
 
-    let kern_hat = Hat::with_top_level(root_table.addr, None);
-    KERNEL_HAT.initialize_with(kern_hat);
+    // Allocate the kernel's top-level PTEs.
+    for i in PTES_PER_TABLE / 2..PTES_PER_TABLE {
+        let page = alloc_page_table();
+        let pte = Pte::new(page.addr, PARENT_FLAGS | PteFlags::PRESENT);
+        unsafe {
+            BootstrapCell::get_mut_ptr(&INITIAL_PTES)
+                .cast::<Pte>()
+                .add(i)
+                .write(pte);
+        }
+    }
+
+    KERNEL_HAT.initialize_with(Hat::new(1));
 }
 
-struct ProtMap([PteFlags; 8]);
+struct ProtMap([PteFlags; 16]);
 
 impl Index<Prot> for ProtMap {
     type Output = PteFlags;
@@ -309,8 +432,9 @@ impl IndexMut<Prot> for ProtMap {
 
 impl ProtMap {
     const fn empty() -> Self {
-        Self([PteFlags::empty(); 8])
+        Self([PteFlags::empty(); 16])
     }
+
     const fn new(nx_bit: PteFlags) -> Self {
         Self([
             /* --- */ nx_bit,
@@ -321,11 +445,19 @@ impl ProtMap {
             /* r-x */ PteFlags::empty(),
             /* rw- */ PteFlags::WRITE.union(nx_bit),
             /* rwx */ PteFlags::WRITE,
+            /* --- */ nx_bit.union(PteFlags::USER),
+            /* --x */ PteFlags::empty().union(PteFlags::USER),
+            /* -w- */ PteFlags::WRITE.union(nx_bit).union(PteFlags::USER),
+            /* -wx */ PteFlags::WRITE.union(PteFlags::USER),
+            /* r-- */ nx_bit.union(PteFlags::USER),
+            /* r-x */ PteFlags::empty().union(PteFlags::USER),
+            /* rw- */ PteFlags::WRITE.union(nx_bit).union(PteFlags::USER),
+            /* rwx */ PteFlags::WRITE.union(PteFlags::USER),
         ])
     }
 }
 
-pub static KERNEL_HAT: Lazy<Mutex<Hat>> = Lazy::new(|| Hat::new(None));
+pub static KERNEL_HAT: Lazy<Mutex<Hat>> = Lazy::new(|| unimplemented!());
 
 /// Allocate a new, empty [`PageTable`]
 fn alloc_page_table() -> &'static vm::Page {
@@ -344,6 +476,8 @@ static PROT_MAP: Lazy<ProtMap> = Lazy::new(|| {
 });
 
 bitflags::bitflags! {
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PteFlags : u64 {
         const PRESENT             = 1 << 0;
         const WRITE               = 1 << 1;
@@ -371,6 +505,8 @@ impl From<Prot> for PteFlags {
 struct Pte(u64);
 
 impl Pte {
+    const NULL: Self = Self(0);
+
     const ADDR_MASK: u64 = 0x000ffffffffff000;
 
     const fn new(addr: PhysAddr, flags: PteFlags) -> Pte {
@@ -402,6 +538,6 @@ impl fmt::Debug for Pte {
 
 impl ops::BitOrAssign<PteFlags> for Pte {
     fn bitor_assign(&mut self, rhs: PteFlags) {
-        self.0 |= rhs.bits;
+        self.0 |= rhs.bits();
     }
 }
