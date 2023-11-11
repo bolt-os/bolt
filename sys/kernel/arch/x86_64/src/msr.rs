@@ -28,6 +28,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#[inline]
 pub unsafe fn wrmsr(addr: u32, value: u64) {
     asm!(
         "wrmsr",
@@ -38,11 +39,18 @@ pub unsafe fn wrmsr(addr: u32, value: u64) {
     );
 }
 
+#[inline]
 pub unsafe fn rdmsr(addr: u32) -> u64 {
     let value_lo: u32;
     let value_hi: u32;
 
-    asm!("rdmsr", in("ecx") addr, out("edx") value_hi, out("eax") value_lo, options(nomem, nostack, preserves_flags));
+    asm!(
+        "rdmsr",
+        in("ecx") addr,
+        out("edx") value_hi,
+        out("eax") value_lo,
+        options(nomem, nostack, preserves_flags)
+    );
 
     (value_hi as u64) << 32 | value_lo as u64
 }
